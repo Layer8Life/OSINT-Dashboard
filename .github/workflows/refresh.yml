@@ -1,0 +1,83 @@
+# Every 6 hours: run the collector, commit the new Snapshot, rebuild and deploy the site.
+# See docs/adr/0001-static-site-with-committed-snapshots.md
+name: Refresh
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["web/**", "!web/public/data/**", ".github/workflows/**"]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Code-only pushes just redeploy; they don't spend a Refresh.
+      - name: Set up Python
+        if: github.event_name != 'push'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: collector/requirements.txt
+
+      - name: Cache GeoNames gazetteer
+        if: github.event_name != 'push'
+        uses: actions/cache@v4
+        with:
+          path: collector/.cache
+          key: geonames-v1
+
+      - name: Run collector
+        if: github.event_name != 'push'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+        run: |
+          pip install -r collector/requirements.txt
+          python -m pytest collector/tests -q
+          python -m collector
+
+      - name: Commit Snapshot
+        if: github.event_name != 'push'
+        run: |
+          git config user.name "osint-refresh-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A web/public/data
+          git diff --cached --quiet || git commit -m "Refresh $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build site
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
